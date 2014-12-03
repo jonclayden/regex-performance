@@ -1,0 +1,175 @@
+# Regex Performance
+
+Interfaces to at least four regular expression libraries are available to R users: PCRE and TRE, which are used by base R, ICU(4C), used by the `stringi` package, and Onigmo, via the `ore` package. Of these four, all but TRE have similar scope, being comparable to regular expression support in the Perl language. This notebook explores how the performance of the three remaining options measures up.
+
+Benchmarking regular expressions is notoriously difficult, as performance will depend on the exact test strings and regex patterns used. There are typically some pathological regular expressions which will degrade performance dramatically, but these are likely to be different for different libraries. So this benchmark only aims to be indicative rather than definitive. Nevertheless, it should give some idea about relative real-world performance.
+
+## Set-up
+
+Code performance will always depend to some extent on the system which it is running. For string functions it is also useful to know the locale that R is using. We can get information on these via R's `sessionInfo` function.
+
+```{r}
+sessionInfo()
+```
+
+It is also important to know the compiler flags used to build R, since optimisations can improve speed noticeably. These flags are also used to build packages, unless they are overridden. We can obtain them from R's main `Makeconf` file.
+
+```{r}
+cat(grep("^[#\\s]+configure", readLines(file.path(R.home("etc"),"Makeconf")), perl=TRUE, value=TRUE))
+```
+
+Finally, we want to know the versions of the packages we are testing.
+
+```{r}
+installed.packages()[c("base","ore","stringi"),"Version"]
+```
+
+When running the benchmark it is wise to build `ore` and `stringi` from source if possible, to ensure that the compiler flags match those used for base R.
+
+## Test cases
+
+The test cases used here are heavily influenced by previous regex performance comparisons [here](http://sljit.sourceforge.net/regex_perf.html) and [here](http://www.boost.org/doc/libs/1_41_0/libs/regex/doc/gcc-performance.html). The text that we are searching through is the Project Gutenberg version of *The Adventures of Sherlock Holmes*, available for free as a [UTF-8 encoded text file](https://www.gutenberg.org/ebooks/1661). The regular expressions tested are as follows:
+
+| Regex pattern                               | Meaning                                                                                  |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `Sherlock`                                  | The literal string, "Sherlock"                                                           |
+| `^Sherlock`                                 | "Sherlock" at the beginning of a line                                                    |
+| `Sherlock$`                                 | "Sherlock" at the end of a line                                                          |
+| `a[^x]{20}b`                                | The letters "a" and "b", separated by 20 other characters that aren't "x"                |
+| `Holmes|Watson`                             | Either of the strings "Holmes" or "Watson"                                               |
+| `.{0,3}(Holmes|Watson)`                     | Zero to three characters, followed by either of the strings "Holmes" or "Watson"         |
+| `[a-zA-Z]+ing`                              | Any word ending in "ing"                                                                 |
+| `^[a-zA-Z]{0,4}ing[^a-zA-Z]`                | Any four letters followed by "ing" and then a non-letter, at the beginning of a line     |
+| `[a-zA-Z]+ing$`                             | Any word ending in "ing", at the end of a line                                           |
+| `^[a-zA-Z ]{5,}$`                           | Lines consisting of five or more letters and spaces, only                                |
+| `^.{16,20}$`                                | Lines of between 16 and 20 characters                                                    |
+| `([a-f](.[d-m].){0,2}[h-n]){2}`             | Sequences of characters from certain sets (complex to explain!)                          |
+| `([A-Za-z]olmes|[A-Za-z]atson)[^a-zA-Z]`    | A word ending in "olmes" or "atson", followed by a non-letter                            |
+| `"[^"]{0,30}[?!\.]"`                        | A quoted string of between 0 and 30 characters, ending with a punctuation mark           |
+| `Holmes.{10,60}Watson|Watson.{10,60}Holmes` | The names "Holmes" and "Watson" on the same line, separated by 10 to 60 other characters |
+
+We use the `gregexpr` (from base R), `stri_locate_all_regex` (from `stringi`) and `ore.search` (from `ore`) functions to find all matches, both considering the whole text as one long string, and with each line as a separate string. In the former case, the multiline option is given where needed to ensure that `^` and `$` match the beginnings and ends of lines, rather than just the string as a whole. For `ore` we also consider the effect of precompiling the regular expression in each case. The `microbenchmark` package is used to run each regex on each library ten times, in a randomised order, and calculate run-times to microsecond precision.
+
+## R code
+
+The following R code sets up the benchmark, loading in the target document and creating functions to run the searches and plot the results.
+
+```{r}
+library(ore)
+library(stringi)
+library(microbenchmark)
+library(methods)
+library(ggplot2)
+
+# Target document: The Adventures of Sherlock Holmes
+text <- readLines("pg1661.txt", encoding="UTF-8")
+
+regexes <- c("Sherlock",
+             "^Sherlock",
+             "Sherlock$",
+             "a[^x]{20}b",
+             "Holmes|Watson",
+             ".{0,3}(Holmes|Watson)",
+             "[a-zA-Z]+ing",
+             "^[a-zA-Z]{0,4}ing[^a-zA-Z]",
+             "[a-zA-Z]+ing$",
+             "^[a-zA-Z ]{5,}$",
+             "^.{16,20}$",
+             "([a-f](.[d-m].){0,2}[h-n]){2}",
+             "([A-Za-z]olmes|[A-Za-z]atson)[^a-zA-Z]",
+             "\"[^\"]{0,30}[?!\\.]\"",
+             "Holmes.{10,60}Watson|Watson.{10,60}Holmes")
+
+methods <- c("base (PCRE)", "ore", "ore (precompiled)", "stringi")
+
+# This function runs the benchmark and collates the results. With vector=TRUE,
+# the lines are passed as a vector, otherwise they are concatenated into a
+# single long string.
+run <- function (vector = FALSE)
+{
+    results <- NULL
+    
+    if (!vector)
+        text <- paste(text, collapse="\n")
+    
+    for (regex in regexes)
+    {
+        if (vector)
+        {
+            # No-op cases
+            stringiOpts <- NULL
+            prefixedRegex <- regex
+        }
+        else
+        {
+            # Set the multiline options for PCRE and ICU4C, needed to ensure
+            # that ^ and $ are interpreted correctly. Oniguruma does this by
+            # default, so no special option is needed.
+            stringiOpts <- stri_opts_regex(multiline=TRUE)
+            prefixedRegex <- paste("(?m)", regex, sep="")
+        }
+        
+        # Compile the regex for use with ore.search
+        compiledRegex <- ore(regex, encoding="UTF-8")
+        
+        # Run the benchmark for ten iterations each, in a randomised order
+        benchmark <- microbenchmark(gregexpr(prefixedRegex, text, perl=TRUE),
+                                    ore.search(regex, text, all=TRUE),
+                                    ore.search(compiledRegex, text, all=TRUE),
+                                    stri_locate_all_regex(text, regex, opts_regex=stringiOpts),
+                                    times=10L)
+        
+        # Append the results to the main data frame
+        benchmark$time <- benchmark$time / 1000
+        benchmark$regex <- regex
+        benchmark$method <- benchmark$expr
+        levels(benchmark$method) <- methods
+        results <- rbind(results, as.data.frame(benchmark))
+    }
+    
+    results$regex <- factor(results$regex, levels=regexes)
+    return(results)
+}
+
+# This function plots the benchmark results. If log=TRUE then the times are
+# shown on a logarithmic axis.
+plot <- function (results, log = TRUE)
+{
+    # Build the plot
+    plot <- ggplot(results, aes(x=method,y=time,fill=method)) +
+            stat_summary(fun.y="median", geom="bar") +
+            geom_point(colour=rgb(0,0,0,0.5)) +
+            coord_flip() +
+            facet_wrap(~regex) +
+            xlab("") +
+            ylab(expression(paste("time, ",mu,"s"))) +
+            theme(strip.text=element_text(size=rel(0.6)), legend.position=c(0.9,0.12))
+    
+    # Use a log scale if requested
+    if (log)
+        return(plot + scale_y_log10())
+    else
+        return(plot)
+}
+```
+
+## Results
+
+We start with the unvectorised case, where the search text is stored in a single string. The barplot below shows median run-times, with individual times shown by dots. The time axis is necessarily logarithmic, because performance varies widely between packages.
+
+```{r, fig.width=10, fig.height=6}
+results <- run(vector=FALSE)
+plot(results)
+```
+
+We see that base R performs extremely badly in this case, worse than `stringi` or `ore` by a large margin. On a non-logarithmic scale the run-times for the latter two packages are so small as to be invisible. `ore` does as well as `stringi` or better for all cases, with the marginal exception of `^.{16,20}$`, although precompiling each regular expression makes little difference when searching through a large document like this.
+
+In the vectorised case base R with PCRE does somewhat better, but it is still consistently outperformed by the other two packages, sometimes by a lot. The results with and without log axes are shown below.
+
+```{r, fig.width=10, fig.height=6}
+results <- run(vector=TRUE)
+plot(results)
+plot(results, log=FALSE)
+```
+
+In this case the relative performance of `ore` and `stringi` is more mixed. This may be partly because it is no longer necessary to use the multiline option in the latter, since each string is a line. Again, the pattern `^.{16,20}$` is amongst the worst cases for `ore`, while `stringi` is substantially slower for `.{0,3}(Holmes|Watson)`. The timings for `ore` are generally somewhat more variable.

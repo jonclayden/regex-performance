@@ -39,7 +39,7 @@ The test cases used here are heavily influenced by previous regex performance co
 | `Holmes|Watson`                             | Either of the strings "Holmes" or "Watson"                                               |
 | `.{0,3}(Holmes|Watson)`                     | Zero to three characters, followed by either of the strings "Holmes" or "Watson"         |
 | `[a-zA-Z]+ing`                              | Any word ending in "ing"                                                                 |
-| `^[a-zA-Z]{0,4}ing[^a-zA-Z]`                | Any four letters followed by "ing" and then a non-letter, at the beginning of a line     |
+| `^([a-zA-Z]{0,4}ing)[^a-zA-Z]`              | Up to four letters followed by "ing" and then a non-letter, at the beginning of a line   |
 | `[a-zA-Z]+ing$`                             | Any word ending in "ing", at the end of a line                                           |
 | `^[a-zA-Z ]{5,}$`                           | Lines consisting of five or more letters and spaces, only                                |
 | `^.{16,20}$`                                | Lines of between 16 and 20 characters                                                    |
@@ -71,7 +71,7 @@ regexes <- c("Sherlock",
              "Holmes|Watson",
              ".{0,3}(Holmes|Watson)",
              "[a-zA-Z]+ing",
-             "^[a-zA-Z]{0,4}ing[^a-zA-Z]",
+             "^([a-zA-Z]{0,4}ing)[^a-zA-Z]",
              "[a-zA-Z]+ing$",
              "^[a-zA-Z ]{5,}$",
              "^.{16,20}$",
@@ -81,6 +81,14 @@ regexes <- c("Sherlock",
              "Holmes.{10,60}Watson|Watson.{10,60}Holmes")
 
 methods <- c("base (PCRE)", "ore", "ore (precompiled)", "stringi")
+
+.makeResult <- function (benchmark, ...)
+{
+    benchmark$time <- benchmark$time / 1000
+    benchmark$method <- benchmark$expr
+    levels(benchmark$method) <- methods
+    return (cbind(benchmark, data.frame(...)))
+}
 
 # This function runs the benchmark and collates the results. With vector=TRUE,
 # the lines are passed as a vector, otherwise they are concatenated into a
@@ -120,11 +128,7 @@ run <- function (vector = FALSE)
                                     times=10L)
         
         # Append the results to the main data frame
-        benchmark$time <- benchmark$time / 1000
-        benchmark$regex <- regex
-        benchmark$method <- benchmark$expr
-        levels(benchmark$method) <- methods
-        results <- rbind(results, as.data.frame(benchmark))
+        results <- rbind(results, .makeResult(benchmark,regex=regex))
     }
     
     results$regex <- factor(results$regex, levels=regexes)
@@ -140,11 +144,14 @@ plot <- function (results, log = TRUE)
             stat_summary(fun.y="median", geom="bar") +
             geom_point(colour=rgb(0,0,0,0.5)) +
             coord_flip() +
-            facet_wrap(~regex) +
             xlab("") +
-            ylab(expression(paste("time, ",mu,"s"))) +
-            theme(strip.text=element_text(size=rel(0.6)), legend.position=c(0.9,0.12))
+            ylab(expression(paste("time, ",mu,"s")))
     
+    if ("regex" %in% colnames(results))
+        plot <- plot + facet_wrap(~regex) + theme(strip.text=element_text(size=rel(0.6)), legend.position=c(0.9,0.12))
+    else
+        plot <- plot + facet_wrap(~task)
+        
     # Use a log scale if requested
     if (log)
         return(plot + scale_y_log10())
@@ -173,3 +180,83 @@ plot(results, log=FALSE)
 ```
 
 In this case the relative performance of `ore` and `stringi` is more mixed. This may be partly because it is no longer necessary to use the multiline option in the latter, since each string is a line. Again, the pattern `^.{16,20}$` is amongst the worst cases for `ore`, while `stringi` is substantially slower for `.{0,3}(Holmes|Watson)`. The timings for `ore` are generally somewhat more variable.
+
+## Additional operations
+
+```{r}
+run <- function (regex, vector = FALSE)
+{
+    results <- NULL
+    
+    if (!vector)
+        text <- paste(text, collapse="\n")
+    
+    if (vector)
+    {
+        # No-op cases
+        stringiOpts <- NULL
+        prefixedRegex <- regex
+    }
+    else
+    {
+        # Set the multiline options for PCRE and ICU4C, needed to ensure
+        # that ^ and $ are interpreted correctly. Oniguruma does this by
+        # default, so no special option is needed.
+        stringiOpts <- stri_opts_regex(multiline=TRUE)
+        prefixedRegex <- paste("(?m)", regex, sep="")
+    }
+    
+    # Compile the regex for use with ore.search
+    compiledRegex <- ore(regex, encoding="UTF-8")
+    
+    # Search only
+    benchmark <- microbenchmark(gregexpr(prefixedRegex, text, perl=TRUE),
+                                ore.search(regex, text, all=TRUE),
+                                ore.search(compiledRegex, text, all=TRUE),
+                                stri_locate_all_regex(text, regex, opts_regex=stringiOpts),
+                                times=10L)
+    results <- rbind(results, .makeResult(benchmark,task="search only"))
+    
+    # Extracting matches
+    benchmark <- microbenchmark(regmatches(text, gregexpr(prefixedRegex, text, perl=TRUE)),
+                                ore.search(regex, text, all=TRUE),
+                                ore.search(compiledRegex, text, all=TRUE),
+                                stri_match_all_regex(text, regex, opts_regex=stringiOpts),
+                                times=10L)
+    results <- rbind(results, .makeResult(benchmark,task="extracting matches"))
+    
+    # Splitting by regex
+    benchmark <- microbenchmark(strsplit(text, prefixedRegex, perl=TRUE),
+                                ore.split(regex, text),
+                                ore.split(compiledRegex, text),
+                                stri_split_regex(text, regex, opts_regex=stringiOpts),
+                                times=10L)
+    results <- rbind(results, .makeResult(benchmark,task="splitting by regex"))
+    
+    # Simple substitution
+    benchmark <- microbenchmark(gsub(prefixedRegex, "*...ing*", text, perl=TRUE),
+                                ore.subst(regex, "*...ing*", text, all=TRUE),
+                                ore.subst(compiledRegex, "*...ing*", text, all=TRUE),
+                                stri_replace_all_regex(text, regex, "*...ing*", opts_regex=stringiOpts),
+                                times=10L)
+    results <- rbind(results, .makeResult(benchmark,task="simple substitution"))
+    
+    # Back-referenced substitution
+    benchmark <- microbenchmark(gsub(prefixedRegex, "*\\1*", text, perl=TRUE),
+                                ore.subst(regex, "*\\1*", text, all=TRUE),
+                                ore.subst(compiledRegex, "*\\1*", text, all=TRUE),
+                                stri_replace_all_regex(text, regex, "*$1*", opts_regex=stringiOpts),
+                                times=10L)
+    results <- rbind(results, .makeResult(benchmark,task="back-referenced substitution"))
+    
+    results$task <- factor(results$task)
+    return(results)
+}
+```
+
+```{r fig.width=10, fig.height=6}
+results <- run("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=FALSE)
+plot(results)
+results <- run("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=TRUE)
+plot(results)
+```

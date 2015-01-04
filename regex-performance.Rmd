@@ -93,7 +93,7 @@ methods <- c("base (PCRE)", "ore", "ore (precompiled)", "stringi")
 # This function runs the benchmark and collates the results. With vector=TRUE,
 # the lines are passed as a vector, otherwise they are concatenated into a
 # single long string.
-run <- function (vector = FALSE)
+regexTest <- function (vector = FALSE)
 {
     results <- NULL
     
@@ -150,7 +150,7 @@ plot <- function (results, log = TRUE)
     if ("regex" %in% colnames(results))
         plot <- plot + facet_wrap(~regex) + theme(strip.text=element_text(size=rel(0.6)), legend.position=c(0.9,0.12))
     else
-        plot <- plot + facet_wrap(~task)
+        plot <- plot + facet_wrap(~task) + theme(legend.position=c(0.85,0.3))
         
     # Use a log scale if requested
     if (log)
@@ -165,26 +165,28 @@ plot <- function (results, log = TRUE)
 We start with the unvectorised case, where the search text is stored in a single string. The barplot below shows median run-times, with individual times shown by dots. The time axis is necessarily logarithmic, because performance varies widely between packages.
 
 ```{r, fig.width=10, fig.height=6}
-results <- run(vector=FALSE)
+results <- regexTest(vector=FALSE)
 plot(results)
 ```
 
-We see that base R performs extremely badly in this case, worse than `stringi` or `ore` by a large margin. On a non-logarithmic scale the run-times for the latter two packages are so small as to be invisible. `ore` does as well as `stringi` or better for all cases, with the marginal exception of `^.{16,20}$`, although precompiling each regular expression makes little difference when searching through a large document like this.
+We see that base R performs extremely badly in this case, worse than `stringi` or `ore` by a large margin. On a non-logarithmic scale the run-times for the latter two packages are so small as to be invisible. `ore` and `stringi` are generally closely matched, although clearly each package has some better and some worse cases, relative to the other. Precompiling each regular expression makes little difference when searching through a large document like this.
 
 In the vectorised case base R with PCRE does somewhat better, but it is still consistently outperformed by the other two packages, sometimes by a lot. The results with and without log axes are shown below.
 
 ```{r, fig.width=10, fig.height=6}
-results <- run(vector=TRUE)
+results <- regexTest(vector=TRUE)
 plot(results)
 plot(results, log=FALSE)
 ```
 
-In this case the relative performance of `ore` and `stringi` is more mixed. This may be partly because it is no longer necessary to use the multiline option in the latter, since each string is a line. Again, the pattern `^.{16,20}$` is amongst the worst cases for `ore`, while `stringi` is substantially slower for `.{0,3}(Holmes|Watson)`. The timings for `ore` are generally somewhat more variable.
+Again, the relative performance of `ore` and `stringi` is mixed, although there is some evidence that the timings for `ore` tend to be somewhat more variable.
 
 ## Additional operations
 
+In addition to simple search, the basic regex operation where we are searching for one or more matches to the pattern, there are other standard operations provided by regex packages. These include extracting the matches themselves (although this is performed by default in `ore`), splitting strings at matches to the pattern, and replacing each match with new text. The following code evaluates the three packages' performance in these tasks, using a single regular expression.
+
 ```{r}
-run <- function (regex, vector = FALSE)
+taskTest <- function (regex, vector = FALSE)
 {
     results <- NULL
     
@@ -254,9 +256,25 @@ run <- function (regex, vector = FALSE)
 }
 ```
 
+Again, we consider the unvectorised case first.
+
 ```{r fig.width=10, fig.height=6}
-results <- run("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=FALSE)
-plot(results)
-results <- run("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=TRUE)
+results <- taskTest("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=FALSE)
 plot(results)
 ```
+
+Once again, base R is heavily outperformed by `stringi` and `ore`. Moreover, unlike the other two packages, it cannot currently capture the parenthesised group, `([a-zA-Z]{0,4}ing)`; only the match as a whole.
+
+Let's finally consider the vectorised case, with and without a log time scale.
+
+```{r fig.width=10, fig.height=6}
+results <- taskTest("^([a-zA-Z]{0,4}ing)[^a-zA-Z]", vector=TRUE)
+plot(results)
+plot(results, log=FALSE) + ylim(0, 3e4)
+```
+
+For splitting by a regex, the three packages finally perform very similarly in this vectorised case, and for substitution `stringi` is currently the slowest of the three packages in this test, with base R and `ore` performing similarly.
+
+## Conclusions
+
+As stated at the beginning of this notebook, definitive benchmarking of regular expression engines and their interfaces is very challenging. Nevertheless, on the basis of these results, it would seem that CRAN packages `ore` and `stringi` substantially outperform base R with PCRE when working with long strings, or when the task at hand is primarily search. When performing substitutions on vectors of strings, `ore` may have an edge over `stringi`, but otherwise the two packages' performance is similar. The best choice of package is therefore likely to depend largely on taste.
